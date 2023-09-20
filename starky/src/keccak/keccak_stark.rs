@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn keccak_benchmark() -> Result<()> {
+    fn keccak_benchmark_poseidon() -> Result<()> {
         const NUM_PERMS: usize = 85;
         const D: usize = 2;
         type C = PoseidonGoldilocksConfig;
@@ -749,7 +749,40 @@ mod tests {
     }
 
     #[test]
-    fn keccak_recursive_benchmark() -> Result<()> {
+    fn keccak_benchmark_keccak() -> Result<()> {
+        const NUM_PERMS: usize = 85;
+        const D: usize = 2;
+        type C = KeccakGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type S = KeccakStark<F, D>;
+        let stark = S::default();
+        let config = StarkConfig::standard_fast_config();
+
+        init_logger();
+
+        let input: Vec<[u64; NUM_INPUTS]> = (0..NUM_PERMS).map(|_| rand::random()).collect();
+
+        let mut timing = TimingTree::new("prove and verify", log::Level::Debug);
+        let trace_poly_values = timed!(
+            timing,
+            "generate trace",
+            stark.generate_trace(input.try_into().unwrap(), 8, &mut timing)
+        );
+
+        let proof = timed!(
+            timing,
+            "prove",
+            prove::<F, C, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+        );
+
+        timed!(timing, "verify", verify_stark_proof(stark, proof, &config)?);
+
+        timing.print();
+        Ok(())
+    }
+
+    #[test]
+    fn keccak_recursive_benchmark_poseidon() -> Result<()> {
         const NUM_PERMS: usize = 85;
         const D: usize = 2;
         type InnerC = PoseidonGoldilocksConfig;

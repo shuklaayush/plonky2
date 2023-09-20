@@ -635,7 +635,9 @@ mod tests {
     use plonky2::iop::witness::PartialWitness;
     use plonky2::plonk::circuit_builder::CircuitBuilder;
     use plonky2::plonk::circuit_data::CircuitConfig;
-    use plonky2::plonk::config::{AlgebraicHasher, GenericConfig, PoseidonGoldilocksConfig};
+    use plonky2::plonk::config::{
+        AlgebraicHasher, GenericConfig, KeccakGoldilocksConfig, PoseidonGoldilocksConfig,
+    };
     use plonky2::timed;
     use plonky2::util::timing::TimingTree;
     use tiny_keccak::keccakf;
@@ -747,11 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn keccak_recursive_stark_verifier_benchmark() -> Result<()> {
+    fn keccak_recursive_benchmark() -> Result<()> {
         const NUM_PERMS: usize = 85;
         const D: usize = 2;
+        type InnerC = PoseidonGoldilocksConfig;
         type C = PoseidonGoldilocksConfig;
-        type F = <C as GenericConfig<D>>::F;
+        type F = <InnerC as GenericConfig<D>>::F;
         type S = KeccakStark<F, D>;
         let stark = S::default();
         let config = StarkConfig::standard_fast_config();
@@ -770,7 +773,7 @@ mod tests {
         let proof = timed!(
             timing,
             "prove",
-            prove::<F, C, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+            prove::<F, InnerC, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
         );
 
         timed!(
@@ -780,8 +783,51 @@ mod tests {
         );
         timed!(
             timing,
-            "recursive proof",
-            recursive_proof::<F, C, S, C, D>(stark, proof, &config, true)?
+            "recursive prove",
+            recursive_proof::<F, C, S, InnerC, D>(stark, proof, &config, true)?
+        );
+
+        timing.print();
+        Ok(())
+    }
+
+    #[test]
+    fn keccak_recursive_benchmark_keccak() -> Result<()> {
+        const NUM_PERMS: usize = 85;
+        const D: usize = 2;
+        type InnerC = PoseidonGoldilocksConfig;
+        type C = KeccakGoldilocksConfig;
+        type F = <InnerC as GenericConfig<D>>::F;
+        type S = KeccakStark<F, D>;
+        let stark = S::default();
+        let config = StarkConfig::standard_fast_config();
+
+        init_logger();
+
+        let input: Vec<[u64; NUM_INPUTS]> = (0..NUM_PERMS).map(|_| rand::random()).collect();
+
+        let mut timing = TimingTree::new("prove and verify", log::Level::Debug);
+
+        let trace_poly_values = timed!(
+            timing,
+            "generate trace",
+            stark.generate_trace(input.try_into().unwrap(), 8, &mut timing)
+        );
+        let proof = timed!(
+            timing,
+            "prove",
+            prove::<F, InnerC, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+        );
+
+        timed!(
+            timing,
+            "verify",
+            verify_stark_proof(stark, proof.clone(), &config)?
+        );
+        timed!(
+            timing,
+            "recursive prove",
+            recursive_proof::<F, C, S, InnerC, D>(stark, proof, &config, true)?
         );
 
         timing.print();

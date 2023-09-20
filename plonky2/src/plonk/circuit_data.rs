@@ -158,12 +158,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
-        prove::<F, C, D>(
-            &self.prover_only,
-            &self.common,
-            inputs,
-            &mut TimingTree::default(),
-        )
+        let mut timing = TimingTree::new("prove", log::Level::Trace);
+        let proof = prove::<F, C, D>(&self.prover_only, &self.common, inputs, &mut timing);
+        timing.print();
+        proof
     }
 
     pub fn verify(&self, proof_with_pis: ProofWithPublicInputs<F, C, D>) -> Result<()> {

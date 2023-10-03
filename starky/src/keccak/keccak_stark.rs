@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn keccak_recursive_benchmark_poseidon() -> Result<()> {
-        const NUM_PERMS: usize = 85;
+        const NUM_PERMS: usize = 5000;
         const D: usize = 2;
         type InnerC = PoseidonGoldilocksConfig;
         type C = PoseidonGoldilocksConfig;
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn keccak_recursive_benchmark_keccak() -> Result<()> {
-        const NUM_PERMS: usize = 85;
+        const NUM_PERMS: usize = 5000;
         const D: usize = 2;
         type InnerC = PoseidonGoldilocksConfig;
         type C = KeccakGoldilocksConfig;

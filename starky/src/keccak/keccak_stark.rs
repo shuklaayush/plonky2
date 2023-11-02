@@ -6,14 +6,16 @@ use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::hash::hash_types::RichField;
+use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::plonk::plonk_common::reduce_with_powers_ext_circuit;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
 use crate::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
+use crate::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use crate::keccak::columns::{
     reg_a, reg_a_prime, reg_a_prime_prime, reg_a_prime_prime_0_0_bit, reg_a_prime_prime_prime,
-    reg_b, reg_c, reg_c_prime, reg_preimage, reg_step, NUM_COLUMNS,
+    reg_b, reg_c, reg_c_prime, reg_step, NUM_COLUMNS, NUM_PUBLIC_INPUTS, TIMESTAMP,
 };
 use crate::keccak::constants::{rc_value, rc_value_bit};
 use crate::keccak::logic::{
@@ -22,7 +24,6 @@ use crate::keccak::logic::{
 use crate::keccak::round_flags::{eval_round_flags, eval_round_flags_recursively};
 use crate::stark::Stark;
 use crate::util::trace_rows_to_poly_values;
-use crate::vars::{StarkEvaluationTargets, StarkEvaluationVars};
 
 /// Number of rounds in a Keccak permutation.
 pub(crate) const NUM_ROUNDS: usize = 24;
@@ -40,16 +41,16 @@ impl<F: RichField + Extendable<D>, const D: usize> KeccakStark<F, D> {
     /// in our lookup arguments, as those are computed after transposing to column-wise form.
     fn generate_trace_rows(
         &self,
-        inputs: Vec<[u64; NUM_INPUTS]>,
+        inputs_and_timestamps: Vec<([u64; NUM_INPUTS], usize)>,
         min_rows: usize,
     ) -> Vec<[F; NUM_COLUMNS]> {
-        let num_rows = (inputs.len() * NUM_ROUNDS)
+        let num_rows = (inputs_and_timestamps.len() * NUM_ROUNDS)
             .max(min_rows)
             .next_power_of_two();
 
         let mut rows = Vec::with_capacity(num_rows);
-        for input in inputs.iter() {
-            let rows_for_perm = self.generate_trace_rows_for_perm(*input);
+        for input_and_timestamp in inputs_and_timestamps.iter() {
+            let rows_for_perm = self.generate_trace_rows_for_perm(*input_and_timestamp);
             rows.extend(rows_for_perm);
         }
 
@@ -59,20 +60,20 @@ impl<F: RichField + Extendable<D>, const D: usize> KeccakStark<F, D> {
         rows
     }
 
-    fn generate_trace_rows_for_perm(&self, input: [u64; NUM_INPUTS]) -> Vec<[F; NUM_COLUMNS]> {
+    fn generate_trace_rows_for_perm(
+        &self,
+        input_and_timestamp: ([u64; NUM_INPUTS], usize),
+    ) -> Vec<[F; NUM_COLUMNS]> {
         let mut rows = vec![[F::ZERO; NUM_COLUMNS]; NUM_ROUNDS];
 
-        // Populate the preimage for each row.
+        let input = input_and_timestamp.0;
+        let timestamp = input_and_timestamp.1;
+        // Set the timestamp of the current input.
+        // It will be checked against the value in `KeccakSponge`.
+        // The timestamp is used to link the input and output of
+        // the same permutation together.
         for round in 0..24 {
-            for x in 0..5 {
-                for y in 0..5 {
-                    let input_xy = input[y * 5 + x];
-                    let reg_preimage_lo = reg_preimage(x, y);
-                    let reg_preimage_hi = reg_preimage_lo + 1;
-                    rows[round][reg_preimage_lo] = F::from_canonical_u64(input_xy & 0xFFFFFFFF);
-                    rows[round][reg_preimage_hi] = F::from_canonical_u64(input_xy >> 32);
-                }
-            }
+            rows[round][TIMESTAMP] = F::from_canonical_usize(timestamp);
         }
 
         // Populate the round input for the first round.
@@ -207,7 +208,7 @@ impl<F: RichField + Extendable<D>, const D: usize> KeccakStark<F, D> {
 
     pub fn generate_trace(
         &self,
-        inputs: Vec<[u64; NUM_INPUTS]>,
+        inputs: Vec<([u64; NUM_INPUTS], usize)>,
         min_rows: usize,
         timing: &mut TimingTree,
     ) -> Vec<PolynomialValues<F>> {
@@ -227,12 +228,17 @@ impl<F: RichField + Extendable<D>, const D: usize> KeccakStark<F, D> {
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F, D> {
-    const COLUMNS: usize = NUM_COLUMNS;
-    const PUBLIC_INPUTS: usize = 0;
+    type EvaluationFrame<FE, P, const D2: usize> = StarkFrame<P, P::Scalar, NUM_COLUMNS, NUM_PUBLIC_INPUTS>
+    where
+        FE: FieldExtension<D2, BaseField = F>,
+        P: PackedField<Scalar = FE>;
+
+    type EvaluationFrameTarget =
+        StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, NUM_COLUMNS, NUM_PUBLIC_INPUTS>;
 
     fn eval_packed_generic<FE, P, const D2: usize>(
         &self,
-        vars: StarkEvaluationVars<FE, P, { Self::COLUMNS }, { Self::PUBLIC_INPUTS }>,
+        vars: &Self::EvaluationFrame<FE, P, D2>,
         yield_constr: &mut ConstraintConsumer<P>,
     ) where
         FE: FieldExtension<D2, BaseField = F>,
@@ -240,47 +246,36 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
     {
         eval_round_flags(vars, yield_constr);
 
+        let local_values = vars.get_local_values();
+        let next_values = vars.get_next_values();
+
         // The filter must be 0 or 1.
-        let filter = vars.local_values[reg_step(NUM_ROUNDS - 1)];
+        let filter = local_values[reg_step(NUM_ROUNDS - 1)];
         yield_constr.constraint(filter * (filter - P::ONES));
 
         // If this is not the final step, the filter must be off.
-        let final_step = vars.local_values[reg_step(NUM_ROUNDS - 1)];
+        let final_step = local_values[reg_step(NUM_ROUNDS - 1)];
         let not_final_step = P::ONES - final_step;
         yield_constr.constraint(not_final_step * filter);
 
-        // If this is not the final step, the local and next preimages must match.
-        // Also, if this is the first step, the preimage must match A.
-        let is_first_step = vars.local_values[reg_step(0)];
-        for x in 0..5 {
-            for y in 0..5 {
-                let reg_preimage_lo = reg_preimage(x, y);
-                let reg_preimage_hi = reg_preimage_lo + 1;
-                let diff_lo =
-                    vars.local_values[reg_preimage_lo] - vars.next_values[reg_preimage_lo];
-                let diff_hi =
-                    vars.local_values[reg_preimage_hi] - vars.next_values[reg_preimage_hi];
-                yield_constr.constraint_transition(not_final_step * diff_lo);
-                yield_constr.constraint_transition(not_final_step * diff_hi);
-
-                let reg_a_lo = reg_a(x, y);
-                let reg_a_hi = reg_a_lo + 1;
-                let diff_lo = vars.local_values[reg_preimage_lo] - vars.local_values[reg_a_lo];
-                let diff_hi = vars.local_values[reg_preimage_hi] - vars.local_values[reg_a_hi];
-                yield_constr.constraint(is_first_step * diff_lo);
-                yield_constr.constraint(is_first_step * diff_hi);
-            }
-        }
+        // If this is not the final step or a padding row,
+        // the local and next timestamps must match.
+        let sum_round_flags = (0..NUM_ROUNDS)
+            .map(|i| local_values[reg_step(i)])
+            .sum::<P>();
+        yield_constr.constraint(
+            sum_round_flags * not_final_step * (next_values[TIMESTAMP] - local_values[TIMESTAMP]),
+        );
 
         // C'[x, z] = xor(C[x, z], C[x - 1, z], C[x + 1, z - 1]).
         for x in 0..5 {
             for z in 0..64 {
                 let xor = xor3_gen(
-                    vars.local_values[reg_c(x, z)],
-                    vars.local_values[reg_c((x + 4) % 5, z)],
-                    vars.local_values[reg_c((x + 1) % 5, (z + 63) % 64)],
+                    local_values[reg_c(x, z)],
+                    local_values[reg_c((x + 4) % 5, z)],
+                    local_values[reg_c((x + 1) % 5, (z + 63) % 64)],
                 );
-                let c_prime = vars.local_values[reg_c_prime(x, z)];
+                let c_prime = local_values[reg_c_prime(x, z)];
                 yield_constr.constraint(c_prime - xor);
             }
         }
@@ -293,12 +288,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         // It isn't required, but makes this check a bit cleaner.
         for x in 0..5 {
             for y in 0..5 {
-                let a_lo = vars.local_values[reg_a(x, y)];
-                let a_hi = vars.local_values[reg_a(x, y) + 1];
+                let a_lo = local_values[reg_a(x, y)];
+                let a_hi = local_values[reg_a(x, y) + 1];
                 let get_bit = |z| {
-                    let a_prime = vars.local_values[reg_a_prime(x, y, z)];
-                    let c = vars.local_values[reg_c(x, z)];
-                    let c_prime = vars.local_values[reg_c_prime(x, z)];
+                    let a_prime = local_values[reg_a_prime(x, y, z)];
+                    let c = local_values[reg_c(x, z)];
+                    let c_prime = local_values[reg_c_prime(x, z)];
                     xor3_gen(a_prime, c, c_prime)
                 };
                 let computed_lo = (0..32)
@@ -318,10 +313,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         for x in 0..5 {
             for z in 0..64 {
                 let sum: P = [0, 1, 2, 3, 4]
-                    .map(|i| vars.local_values[reg_a_prime(x, i, z)])
+                    .map(|i| local_values[reg_a_prime(x, i, z)])
                     .into_iter()
                     .sum();
-                let diff = sum - vars.local_values[reg_c_prime(x, z)];
+                let diff = sum - local_values[reg_c_prime(x, z)];
                 yield_constr
                     .constraint(diff * (diff - FE::TWO) * (diff - FE::from_canonical_u8(4)));
             }
@@ -332,18 +327,18 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
             for y in 0..5 {
                 let get_bit = |z| {
                     xor_gen(
-                        vars.local_values[reg_b(x, y, z)],
+                        local_values[reg_b(x, y, z)],
                         andn_gen(
-                            vars.local_values[reg_b((x + 1) % 5, y, z)],
-                            vars.local_values[reg_b((x + 2) % 5, y, z)],
+                            local_values[reg_b((x + 1) % 5, y, z)],
+                            local_values[reg_b((x + 2) % 5, y, z)],
                         ),
                     )
                 };
 
                 let reg_lo = reg_a_prime_prime(x, y);
                 let reg_hi = reg_lo + 1;
-                let lo = vars.local_values[reg_lo];
-                let hi = vars.local_values[reg_hi];
+                let lo = local_values[reg_lo];
+                let hi = local_values[reg_hi];
                 let computed_lo = (0..32)
                     .rev()
                     .fold(P::ZEROS, |acc, z| acc.doubles() + get_bit(z));
@@ -358,7 +353,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
 
         // A'''[0, 0] = A''[0, 0] XOR RC
         let a_prime_prime_0_0_bits = (0..64)
-            .map(|i| vars.local_values[reg_a_prime_prime_0_0_bit(i)])
+            .map(|i| local_values[reg_a_prime_prime_0_0_bit(i)])
             .collect_vec();
         let computed_a_prime_prime_0_0_lo = (0..32)
             .rev()
@@ -366,15 +361,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         let computed_a_prime_prime_0_0_hi = (32..64)
             .rev()
             .fold(P::ZEROS, |acc, z| acc.doubles() + a_prime_prime_0_0_bits[z]);
-        let a_prime_prime_0_0_lo = vars.local_values[reg_a_prime_prime(0, 0)];
-        let a_prime_prime_0_0_hi = vars.local_values[reg_a_prime_prime(0, 0) + 1];
+        let a_prime_prime_0_0_lo = local_values[reg_a_prime_prime(0, 0)];
+        let a_prime_prime_0_0_hi = local_values[reg_a_prime_prime(0, 0) + 1];
         yield_constr.constraint(computed_a_prime_prime_0_0_lo - a_prime_prime_0_0_lo);
         yield_constr.constraint(computed_a_prime_prime_0_0_hi - a_prime_prime_0_0_hi);
 
         let get_xored_bit = |i| {
             let mut rc_bit_i = P::ZEROS;
             for r in 0..NUM_ROUNDS {
-                let this_round = vars.local_values[reg_step(r)];
+                let this_round = local_values[reg_step(r)];
                 let this_round_constant =
                     P::from(FE::from_canonical_u32(rc_value_bit(r, i) as u32));
                 rc_bit_i += this_round * this_round_constant;
@@ -383,8 +378,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
             xor_gen(a_prime_prime_0_0_bits[i], rc_bit_i)
         };
 
-        let a_prime_prime_prime_0_0_lo = vars.local_values[reg_a_prime_prime_prime(0, 0)];
-        let a_prime_prime_prime_0_0_hi = vars.local_values[reg_a_prime_prime_prime(0, 0) + 1];
+        let a_prime_prime_prime_0_0_lo = local_values[reg_a_prime_prime_prime(0, 0)];
+        let a_prime_prime_prime_0_0_hi = local_values[reg_a_prime_prime_prime(0, 0) + 1];
         let computed_a_prime_prime_prime_0_0_lo = (0..32)
             .rev()
             .fold(P::ZEROS, |acc, z| acc.doubles() + get_xored_bit(z));
@@ -397,11 +392,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         // Enforce that this round's output equals the next round's input.
         for x in 0..5 {
             for y in 0..5 {
-                let output_lo = vars.local_values[reg_a_prime_prime_prime(x, y)];
-                let output_hi = vars.local_values[reg_a_prime_prime_prime(x, y) + 1];
-                let input_lo = vars.next_values[reg_a(x, y)];
-                let input_hi = vars.next_values[reg_a(x, y) + 1];
-                let is_last_round = vars.local_values[reg_step(NUM_ROUNDS - 1)];
+                let output_lo = local_values[reg_a_prime_prime_prime(x, y)];
+                let output_hi = local_values[reg_a_prime_prime_prime(x, y) + 1];
+                let input_lo = next_values[reg_a(x, y)];
+                let input_hi = next_values[reg_a(x, y) + 1];
+                let is_last_round = local_values[reg_step(NUM_ROUNDS - 1)];
                 let not_last_round = P::ONES - is_last_round;
                 yield_constr.constraint_transition(not_last_round * (output_lo - input_lo));
                 yield_constr.constraint_transition(not_last_round * (output_hi - input_hi));
@@ -412,7 +407,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
     fn eval_ext_circuit(
         &self,
         builder: &mut plonky2::plonk::circuit_builder::CircuitBuilder<F, D>,
-        vars: StarkEvaluationTargets<D, { Self::COLUMNS }, { Self::PUBLIC_INPUTS }>,
+        vars: &Self::EvaluationFrameTarget,
         yield_constr: &mut RecursiveConstraintConsumer<F, D>,
     ) {
         let one_ext = builder.one_extension();
@@ -422,64 +417,38 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
 
         eval_round_flags_recursively(builder, vars, yield_constr);
 
+        let local_values = vars.get_local_values();
+        let next_values = vars.get_next_values();
+
         // The filter must be 0 or 1.
-        let filter = vars.local_values[reg_step(NUM_ROUNDS - 1)];
+        let filter = local_values[reg_step(NUM_ROUNDS - 1)];
         let constraint = builder.mul_sub_extension(filter, filter, filter);
         yield_constr.constraint(builder, constraint);
 
         // If this is not the final step, the filter must be off.
-        let final_step = vars.local_values[reg_step(NUM_ROUNDS - 1)];
+        let final_step = local_values[reg_step(NUM_ROUNDS - 1)];
         let not_final_step = builder.sub_extension(one_ext, final_step);
         let constraint = builder.mul_extension(not_final_step, filter);
         yield_constr.constraint(builder, constraint);
 
-        // If this is not the final step, the local and next preimages must match.
-        // Also, if this is the first step, the preimage must match A.
-        let is_first_step = vars.local_values[reg_step(0)];
-        for x in 0..5 {
-            for y in 0..5 {
-                let reg_preimage_lo = reg_preimage(x, y);
-                let reg_preimage_hi = reg_preimage_lo + 1;
-                let diff = builder.sub_extension(
-                    vars.local_values[reg_preimage_lo],
-                    vars.next_values[reg_preimage_lo],
-                );
-                let constraint = builder.mul_extension(not_final_step, diff);
-                yield_constr.constraint_transition(builder, constraint);
-                let diff = builder.sub_extension(
-                    vars.local_values[reg_preimage_hi],
-                    vars.next_values[reg_preimage_hi],
-                );
-                let constraint = builder.mul_extension(not_final_step, diff);
-                yield_constr.constraint_transition(builder, constraint);
-
-                let reg_a_lo = reg_a(x, y);
-                let reg_a_hi = reg_a_lo + 1;
-                let diff_lo = builder.sub_extension(
-                    vars.local_values[reg_preimage_lo],
-                    vars.local_values[reg_a_lo],
-                );
-                let constraint = builder.mul_extension(is_first_step, diff_lo);
-                yield_constr.constraint(builder, constraint);
-                let diff_hi = builder.sub_extension(
-                    vars.local_values[reg_preimage_hi],
-                    vars.local_values[reg_a_hi],
-                );
-                let constraint = builder.mul_extension(is_first_step, diff_hi);
-                yield_constr.constraint(builder, constraint);
-            }
-        }
+        // If this is not the final step or a padding row,
+        // the local and next timestamps must match.
+        let sum_round_flags =
+            builder.add_many_extension((0..NUM_ROUNDS).map(|i| local_values[reg_step(i)]));
+        let diff = builder.sub_extension(next_values[TIMESTAMP], local_values[TIMESTAMP]);
+        let constr = builder.mul_many_extension([sum_round_flags, not_final_step, diff]);
+        yield_constr.constraint(builder, constr);
 
         // C'[x, z] = xor(C[x, z], C[x - 1, z], C[x + 1, z - 1]).
         for x in 0..5 {
             for z in 0..64 {
                 let xor = xor3_gen_circuit(
                     builder,
-                    vars.local_values[reg_c(x, z)],
-                    vars.local_values[reg_c((x + 4) % 5, z)],
-                    vars.local_values[reg_c((x + 1) % 5, (z + 63) % 64)],
+                    local_values[reg_c(x, z)],
+                    local_values[reg_c((x + 4) % 5, z)],
+                    local_values[reg_c((x + 1) % 5, (z + 63) % 64)],
                 );
-                let c_prime = vars.local_values[reg_c_prime(x, z)];
+                let c_prime = local_values[reg_c_prime(x, z)];
                 let diff = builder.sub_extension(c_prime, xor);
                 yield_constr.constraint(builder, diff);
             }
@@ -493,12 +462,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         // It isn't required, but makes this check a bit cleaner.
         for x in 0..5 {
             for y in 0..5 {
-                let a_lo = vars.local_values[reg_a(x, y)];
-                let a_hi = vars.local_values[reg_a(x, y) + 1];
+                let a_lo = local_values[reg_a(x, y)];
+                let a_hi = local_values[reg_a(x, y) + 1];
                 let mut get_bit = |z| {
-                    let a_prime = vars.local_values[reg_a_prime(x, y, z)];
-                    let c = vars.local_values[reg_c(x, z)];
-                    let c_prime = vars.local_values[reg_c_prime(x, z)];
+                    let a_prime = local_values[reg_a_prime(x, y, z)];
+                    let c = local_values[reg_c(x, z)];
+                    let c_prime = local_values[reg_c_prime(x, z)];
                     xor3_gen_circuit(builder, a_prime, c, c_prime)
                 };
                 let bits_lo = (0..32).map(&mut get_bit).collect_vec();
@@ -518,9 +487,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         for x in 0..5 {
             for z in 0..64 {
                 let sum = builder.add_many_extension(
-                    [0, 1, 2, 3, 4].map(|i| vars.local_values[reg_a_prime(x, i, z)]),
+                    [0, 1, 2, 3, 4].map(|i| local_values[reg_a_prime(x, i, z)]),
                 );
-                let diff = builder.sub_extension(sum, vars.local_values[reg_c_prime(x, z)]);
+                let diff = builder.sub_extension(sum, local_values[reg_c_prime(x, z)]);
                 let diff_minus_two = builder.sub_extension(diff, two_ext);
                 let diff_minus_four = builder.sub_extension(diff, four_ext);
                 let constraint =
@@ -535,16 +504,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
                 let mut get_bit = |z| {
                     let andn = andn_gen_circuit(
                         builder,
-                        vars.local_values[reg_b((x + 1) % 5, y, z)],
-                        vars.local_values[reg_b((x + 2) % 5, y, z)],
+                        local_values[reg_b((x + 1) % 5, y, z)],
+                        local_values[reg_b((x + 2) % 5, y, z)],
                     );
-                    xor_gen_circuit(builder, vars.local_values[reg_b(x, y, z)], andn)
+                    xor_gen_circuit(builder, local_values[reg_b(x, y, z)], andn)
                 };
 
                 let reg_lo = reg_a_prime_prime(x, y);
                 let reg_hi = reg_lo + 1;
-                let lo = vars.local_values[reg_lo];
-                let hi = vars.local_values[reg_hi];
+                let lo = local_values[reg_lo];
+                let hi = local_values[reg_hi];
                 let bits_lo = (0..32).map(&mut get_bit).collect_vec();
                 let bits_hi = (32..64).map(get_bit).collect_vec();
                 let computed_lo = reduce_with_powers_ext_circuit(builder, &bits_lo, two);
@@ -558,14 +527,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
 
         // A'''[0, 0] = A''[0, 0] XOR RC
         let a_prime_prime_0_0_bits = (0..64)
-            .map(|i| vars.local_values[reg_a_prime_prime_0_0_bit(i)])
+            .map(|i| local_values[reg_a_prime_prime_0_0_bit(i)])
             .collect_vec();
         let computed_a_prime_prime_0_0_lo =
             reduce_with_powers_ext_circuit(builder, &a_prime_prime_0_0_bits[0..32], two);
         let computed_a_prime_prime_0_0_hi =
             reduce_with_powers_ext_circuit(builder, &a_prime_prime_0_0_bits[32..64], two);
-        let a_prime_prime_0_0_lo = vars.local_values[reg_a_prime_prime(0, 0)];
-        let a_prime_prime_0_0_hi = vars.local_values[reg_a_prime_prime(0, 0) + 1];
+        let a_prime_prime_0_0_lo = local_values[reg_a_prime_prime(0, 0)];
+        let a_prime_prime_0_0_hi = local_values[reg_a_prime_prime(0, 0) + 1];
         let diff = builder.sub_extension(computed_a_prime_prime_0_0_lo, a_prime_prime_0_0_lo);
         yield_constr.constraint(builder, diff);
         let diff = builder.sub_extension(computed_a_prime_prime_0_0_hi, a_prime_prime_0_0_hi);
@@ -574,7 +543,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         let mut get_xored_bit = |i| {
             let mut rc_bit_i = builder.zero_extension();
             for r in 0..NUM_ROUNDS {
-                let this_round = vars.local_values[reg_step(r)];
+                let this_round = local_values[reg_step(r)];
                 let this_round_constant = builder
                     .constant_extension(F::from_canonical_u32(rc_value_bit(r, i) as u32).into());
                 rc_bit_i = builder.mul_add_extension(this_round, this_round_constant, rc_bit_i);
@@ -583,8 +552,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
             xor_gen_circuit(builder, a_prime_prime_0_0_bits[i], rc_bit_i)
         };
 
-        let a_prime_prime_prime_0_0_lo = vars.local_values[reg_a_prime_prime_prime(0, 0)];
-        let a_prime_prime_prime_0_0_hi = vars.local_values[reg_a_prime_prime_prime(0, 0) + 1];
+        let a_prime_prime_prime_0_0_lo = local_values[reg_a_prime_prime_prime(0, 0)];
+        let a_prime_prime_prime_0_0_hi = local_values[reg_a_prime_prime_prime(0, 0) + 1];
         let bits_lo = (0..32).map(&mut get_xored_bit).collect_vec();
         let bits_hi = (32..64).map(get_xored_bit).collect_vec();
         let computed_a_prime_prime_prime_0_0_lo =
@@ -605,11 +574,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for KeccakStark<F
         // Enforce that this round's output equals the next round's input.
         for x in 0..5 {
             for y in 0..5 {
-                let output_lo = vars.local_values[reg_a_prime_prime_prime(x, y)];
-                let output_hi = vars.local_values[reg_a_prime_prime_prime(x, y) + 1];
-                let input_lo = vars.next_values[reg_a(x, y)];
-                let input_hi = vars.next_values[reg_a(x, y) + 1];
-                let is_last_round = vars.local_values[reg_step(NUM_ROUNDS - 1)];
+                let output_lo = local_values[reg_a_prime_prime_prime(x, y)];
+                let output_hi = local_values[reg_a_prime_prime_prime(x, y) + 1];
+                let input_lo = next_values[reg_a(x, y)];
+                let input_hi = next_values[reg_a(x, y) + 1];
+                let is_last_round = local_values[reg_step(NUM_ROUNDS - 1)];
                 let diff = builder.sub_extension(input_lo, output_lo);
                 let filtered_diff = builder.mul_sub_extension(is_last_round, diff, diff);
                 yield_constr.constraint_transition(builder, filtered_diff);
@@ -694,7 +663,7 @@ mod tests {
             f: Default::default(),
         };
 
-        let rows = stark.generate_trace_rows(vec![input.try_into().unwrap()], 8);
+        let rows = stark.generate_trace_rows(vec![(input, 0)], 8);
         let last_row = rows[NUM_ROUNDS - 1];
         let output = (0..NUM_INPUTS)
             .map(|i| {
@@ -727,19 +696,20 @@ mod tests {
 
         init_logger();
 
-        let input: Vec<[u64; NUM_INPUTS]> = (0..NUM_PERMS).map(|_| rand::random()).collect();
+        let input: Vec<([u64; NUM_INPUTS], usize)> =
+            (0..NUM_PERMS).map(|_| (rand::random(), 0)).collect();
 
         let mut timing = TimingTree::new("prove and verify", log::Level::Debug);
         let trace_poly_values = timed!(
             timing,
             "generate trace",
-            stark.generate_trace(input.try_into().unwrap(), 8, &mut timing)
+            stark.generate_trace(input, 8, &mut timing)
         );
 
         let proof = timed!(
             timing,
             "prove",
-            prove::<F, C, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+            prove::<F, C, S, D>(stark, &config, trace_poly_values, &[], &mut timing)?
         );
 
         timed!(timing, "verify", verify_stark_proof(stark, proof, &config)?);
@@ -760,19 +730,20 @@ mod tests {
 
         init_logger();
 
-        let input: Vec<[u64; NUM_INPUTS]> = (0..NUM_PERMS).map(|_| rand::random()).collect();
+        let input: Vec<([u64; NUM_INPUTS], usize)> =
+            (0..NUM_PERMS).map(|_| (rand::random(), 0)).collect();
 
         let mut timing = TimingTree::new("prove and verify", log::Level::Debug);
         let trace_poly_values = timed!(
             timing,
             "generate trace",
-            stark.generate_trace(input.try_into().unwrap(), 8, &mut timing)
+            stark.generate_trace(input, 8, &mut timing)
         );
 
         let proof = timed!(
             timing,
             "prove",
-            prove::<F, C, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+            prove::<F, C, S, D>(stark, &config, trace_poly_values, &[], &mut timing)?
         );
 
         timed!(timing, "verify", verify_stark_proof(stark, proof, &config)?);
@@ -794,19 +765,20 @@ mod tests {
 
         init_logger();
 
-        let input: Vec<[u64; NUM_INPUTS]> = (0..NUM_PERMS).map(|_| rand::random()).collect();
+        let input: Vec<([u64; NUM_INPUTS], usize)> =
+            (0..NUM_PERMS).map(|_| (rand::random(), 0)).collect();
 
         let mut timing = TimingTree::new("prove and verify", log::Level::Debug);
 
         let trace_poly_values = timed!(
             timing,
             "generate trace",
-            stark.generate_trace(input.try_into().unwrap(), 8, &mut timing)
+            stark.generate_trace(input, 8, &mut timing)
         );
         let proof = timed!(
             timing,
             "prove",
-            prove::<F, InnerC, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+            prove::<F, InnerC, S, D>(stark, &config, trace_poly_values, &[], &mut timing)?
         );
 
         timed!(
@@ -837,19 +809,20 @@ mod tests {
 
         init_logger();
 
-        let input: Vec<[u64; NUM_INPUTS]> = (0..NUM_PERMS).map(|_| rand::random()).collect();
+        let input: Vec<([u64; NUM_INPUTS], usize)> =
+            (0..NUM_PERMS).map(|_| (rand::random(), 0)).collect();
 
         let mut timing = TimingTree::new("prove and verify", log::Level::Debug);
 
         let trace_poly_values = timed!(
             timing,
             "generate trace",
-            stark.generate_trace(input.try_into().unwrap(), 8, &mut timing)
+            stark.generate_trace(input, 8, &mut timing)
         );
         let proof = timed!(
             timing,
             "prove",
-            prove::<F, InnerC, S, D>(stark, &config, trace_poly_values, [], &mut timing)?
+            prove::<F, InnerC, S, D>(stark, &config, trace_poly_values, &[], &mut timing)?
         );
 
         timed!(
@@ -881,8 +854,6 @@ mod tests {
     ) -> Result<()>
     where
         InnerC::Hasher: AlgebraicHasher<F>,
-        [(); S::COLUMNS]:,
-        [(); S::PUBLIC_INPUTS]:,
     {
         let circuit_config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(circuit_config);

@@ -19,5 +19,5 @@ pub mod util;
 pub mod vanishing_poly;
 pub mod verifier;
 
-#[cfg(test)]
+// #[cfg(test)]
 pub mod fibonacci_stark;

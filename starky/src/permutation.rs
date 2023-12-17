@@ -49,17 +49,17 @@ pub(crate) struct PermutationInstance<'a, T: Copy> {
 
 /// Randomness for a single instance of a permutation check protocol.
 #[derive(Copy, Clone)]
-pub(crate) struct PermutationChallenge<T: Copy> {
+pub struct PermutationChallenge<T: Copy> {
     /// Randomness used to combine multiple columns into one.
-    pub(crate) beta: T,
+    pub beta: T,
     /// Random offset that's added to the beta-reduced column values.
-    pub(crate) gamma: T,
+    pub gamma: T,
 }
 
 /// Like `PermutationChallenge`, but with `num_challenges` copies to boost soundness.
 #[derive(Clone)]
-pub(crate) struct PermutationChallengeSet<T: Copy> {
-    pub(crate) challenges: Vec<PermutationChallenge<T>>,
+pub struct PermutationChallengeSet<T: Copy> {
+    pub challenges: Vec<PermutationChallenge<T>>,
 }
 
 /// Compute all Z polynomials (for permutation arguments).

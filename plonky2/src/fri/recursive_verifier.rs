@@ -372,7 +372,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     /// Thus ambiguous elements contribute a negligible amount to soundness error.
     ///
     /// Here we compare the probabilities as a sanity check, to verify the claim above.
-    fn assert_noncanonical_indices_ok(config: &FriConfig) {
+    pub fn assert_noncanonical_indices_ok(config: &FriConfig) {
         let num_ambiguous_elems = u64::MAX - F::ORDER + 1;
         let query_error = config.rate();
         let p_ambiguous = (num_ambiguous_elems as f64) / (F::ORDER as f64);
